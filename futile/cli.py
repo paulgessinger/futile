@@ -37,8 +37,10 @@ def main(ctx, verbose):
 
     coloredlogs.install(
         fmt="%(asctime)s %(levelname)s %(name)s %(filename)s:%(funcName)s %(message)s",
-        level=global_level,
+        level=level,
     )
+
+    logging.getLogger("sh.command").setLevel(logging.WARNING)
 
     logger.setLevel(level)
 
