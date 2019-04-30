@@ -1,16 +1,21 @@
 import click
-from halo import Halo
 import os
 import yaml
-import sh
 import logging
-import tempfile
 import sys
+import time
 
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.executors.pool import ThreadPoolExecutor
+
+import coloredlogs
+
+from .borg import borg
+from .util import render_info, Spinner, handle_backup_task
 
 APP_NAME = "futile"
-
-borg = sh.Command("borg")
 
 logger = logging.getLogger(APP_NAME)
 
@@ -24,14 +29,14 @@ def main(ctx, verbose):
         level = logging.WARNING
     elif verbose == 1:
         level = logging.INFO
-        global_level = logging.INFO
     elif verbose == 2:
         level = logging.DEBUG
     else:
         level = logging.DEBUG
         global_level = logging.DEBUG
-    logging.basicConfig(
-        format="%(levelname)s %(name)s %(filename)s:%(funcName)s %(message)s",
+
+    coloredlogs.install(
+        fmt="%(asctime)s %(levelname)s %(name)s %(filename)s:%(funcName)s %(message)s",
         level=global_level,
     )
 
@@ -73,88 +78,63 @@ def setup(obj):
 @click.pass_obj
 def backup(obj, dry_run, create, prune, info, progress):
     tasks = obj["config"]["tasks"]
+    verbose = obj["verbose"]
     logger.info("Handling %d tasks", len(tasks))
     for task in tasks:
-        with tempfile.NamedTemporaryFile("w+") as ex_f:
-            source = os.path.expandvars(os.path.expanduser(task["source"]))
-            logger.info("Source: %s", source)
-            logger.debug(
-                "Writing %d exclude patterns to %s",
-                len(task["exclude_patterns"]),
-                ex_f.name,
+        for repo in task["repositories"]:
+            handle_backup_task(
+                task, repo, logger, verbose, dry_run, create, prune, info, progress
             )
-            ex_f.write(
-                "\n".join(
-                    [
-                        os.path.expanduser(os.path.expandvars(e))
-                        for e in task["exclude_patterns"]
-                    ]
-                )
-            )
-            ex_f.flush()
 
-            for repo in task["repositories"]:
-                url = repo["url"]
-                exe = repo.get("executable", "borg")
-                args = repo.get("extra_args", {})
-                archive_name = f"{url}::{task['archive_name']}"
-                logger.info("Destination: %s", archive_name)
 
-                progress = progress and sys.stdout.isatty()
-                fg = progress
+@main.command()
+@click.pass_obj
+def info(obj):
+    tasks = obj["config"]["tasks"]
+    logger.info("Handling %d tasks", len(tasks))
+    for task in tasks:
+        for repo in task["repositories"]:
+            render_info(repo)
 
-                if create:
-                    logger.info("Creating archive...")
-                    spinner = None
-                    if not progress:
-                        spinner = Halo(text="Creating archive")
-                        spinner.start()
-                    try:
-                        borg.create(
-                            archive_name,
-                            source,
-                            progress=progress,
-                            exclude_from=ex_f.name,
-                            remote_path=exe,
-                            dry_run=dry_run,
-                            _fg=fg,
-                            **args,
-                        )
-                        pass
-                    finally:
-                        if spinner is not None:
-                            spinner.stop()
 
-                    logger.info("Archive created")
+@main.command()
+@click.option("--dry-run", "-s", is_flag=True)
+@click.option("--create/--no-create", default=True)
+@click.option("--prune/--no-prune", default=True)
+@click.option("--info/--no-info", default=True)
+@click.option("--progress", is_flag=True)
+@click.pass_obj
+def schedule(obj, dry_run, create, prune, info, progress):
+    for name in ["apscheduler.scheduler", "apscheduler.executors.default"]:
+        l = logging.getLogger(name)
+        l.setLevel(logger.getEffectiveLevel())
 
-                if prune:
-                    retention = task["retention"]
-                    logger.info(
-                        "Pruning: %s",
-                        ", ".join(f"{k}: {v}" for k, v in retention.items()),
-                    )
+    executors = {"default": ThreadPoolExecutor(1)}
+    job_defaults = {"coalesce": True, "max_instances": 1}
+    scheduler = BlockingScheduler(executors=executors, job_defaults=job_defaults)
 
-                    extra = {}
-                    if obj["verbose"] >= 1:
-                        extra["stats"] = True
-                        extra["list"] = True
+    def job(task, repo, logger, verbose, dry_run, create, prune, info, progress):
+        logger.info("Running scheduled job")
+        handle_backup_task(
+            task, repo, logger, verbose, dry_run, create, prune, info, progress
+        )
+        time.sleep(65)
 
-                    with Halo(text=f"Pruning archives at {url}"):
-                        prune = borg.prune(
-                            url,
-                            H=retention["hourly"],
-                            d=retention["daily"],
-                            w=retention["weekly"],
-                            m=retention["monthly"],
-                            y=retention["yearly"],
-                            remote_path=exe,
-                            dry_run=dry_run,
-                            _err_to_out=True,
-                            **extra,
-                        )
-                    print(prune)
+    tasks = obj["config"]["tasks"]
+    verbose = obj["verbose"]
+    logger.info("Preparing scheduling of %d tasks", len(tasks))
 
-                if info:
-                    with Halo(text=f"Getting info on {url}"):
-                        info = borg.info(url, remote_path=exe)
-                    print(info)
+    for task in tasks:
+        repos = task["repositories"]
+        logger.info("Task has %d target repositories", len(repos))
+        for repo in repos:
+            crontab = repo["schedule"]
+            logger.debug("Scheduling backup task with: %s", crontab)
+            args = (task, repo, logger, verbose, dry_run, create, prune, info, progress)
+            scheduler.add_job(job, args=args, trigger=CronTrigger.from_crontab(crontab))
+
+    try:
+        logger.info("Starting scheduler")
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        pass
