@@ -107,6 +107,7 @@ def info(obj):
 @click.option("--progress", is_flag=True)
 @click.pass_obj
 def schedule(obj, dry_run, create, prune, info, progress):
+
     for name in ["apscheduler.scheduler", "apscheduler.executors.default"]:
         l = logging.getLogger(name)
         l.setLevel(logger.getEffectiveLevel())

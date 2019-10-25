@@ -10,6 +10,7 @@ import sh
 from datetime import datetime
 import subprocess
 from urllib.parse import urlparse
+import humanfriendly
 
 from .borg import borg
 
@@ -148,14 +149,14 @@ def handle_backup_task(
             len(task["exclude_patterns"]),
             ex_f.name,
         )
-        ex_f.write(
-            "\n".join(
+        excludes = "\n".join(
                 [
                     os.path.expanduser(os.path.expandvars(e))
                     for e in task["exclude_patterns"]
                 ]
             )
-        )
+
+        ex_f.write(excludes)
         ex_f.flush()
 
         url = repo["url"]
@@ -215,7 +216,7 @@ def handle_backup_task(
                     render_info(repo)
 
             td = datetime.now() - start
-            logger.info("Completed backup in %ds", td.seconds)
+            logger.info("Completed backup in %s", humanfriendly.format_timespan(td.seconds))
         except sh.ErrorReturnCode_1 as e:
             logger.warn("Backup creation raised warning:")
             logger.debug(e.full_cmd)
